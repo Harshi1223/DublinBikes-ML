@@ -1,0 +1,159 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# =========================
+# Virtual Environment
+# =========================
+venv/
+.venv/
+env/
+ENV/
+
+# =========================
+# Distribution / Packaging
+# =========================
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# =========================
+# PyInstaller
+# =========================
+*.manifest
+*.spec
+
+# =========================
+# Unit Test / Coverage
+# =========================
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache/
+.pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# IDE
+# =========================
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# =========================
+# OS Files
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Environment Variables
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Logs
+# =========================
+logs/
+*.log
+
+# =========================
+# Streamlit
+# =========================
+.streamlit/secrets.toml
+
+# =========================
+# Temporary Files
+# =========================
+*.tmp
+*.temp
+
+# =========================
+# mypy
+# =========================
+.mypy_cache/
+
+# =========================
+# Ruff
+# =========================
+.ruff_cache/
+
+# =========================
+# Pyre
+# =========================
+.pyre/
+
+# =========================
+# VS Code Test
+# =========================
+.history/
+
+# =========================
+# macOS
+# =========================
+.AppleDouble
+.LSOverride
+
+# =========================
+# Linux
+# =========================
+*~
+
+# =========================
+# Windows
+# =========================
+ehthumbs.db
+
+# =========================
+# TensorBoard
+# =========================
+logs/
+events.out.tfevents.*
+
+# =========================
+# Model Training Outputs
+# (Uncomment if you DON'T want to upload models)
+# =========================
+# *.keras
+# *.h5
+# *.pkl
+# *.joblib
+# *.json
+
+# =========================
+# Misc
+# =========================
+*.bak
+*.swp
+*.orig
