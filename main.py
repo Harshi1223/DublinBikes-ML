@@ -3,6 +3,7 @@
 
 from fastapi import FastAPI
 from pathlib import Path
+import keras
 import xgboost as xgb
 import joblib
 import pandas as pd
@@ -16,7 +17,7 @@ import threading
 import time as time_module
 from collections import defaultdict
 from datetime import datetime
-from tensorflow import keras
+import tensorflow as tf
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
