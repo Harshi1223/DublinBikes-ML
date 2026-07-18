@@ -1,13 +1,8 @@
 # main.py — Dublin Bikes Shortage Prediction API
-# XGBoost + Logistic Regression + Random Forest + LSTM active
-#
-# Fully live where possible: bikes/docks, lag features,
-# cascade features, weather, and time features are all
-# computed from live sources once enough data has
-# accumulated - falling back to historical values only
-# where live data genuinely isn't available yet.
+# XGBoost + Logistic Regression + Random Forest + LSTM
 
 from fastapi import FastAPI
+from pathlib import Path
 import xgboost as xgb
 import joblib
 import pandas as pd
@@ -16,56 +11,71 @@ import requests
 import os
 import pickle
 import json
+import logging
 import threading
 import time as time_module
 from collections import defaultdict
 from datetime import datetime
-import tensorflow as tf
-import keras
+from tensorflow import keras
 
-model = keras.Sequential()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+BASE_DIR = Path(__file__).resolve().parent
+MODELS_DIR = BASE_DIR / "models"
+DATA_DIR = BASE_DIR / "data"
+
 app = FastAPI(title="Dublin Bikes Shortage Prediction API")
+
+# ---------- Constants ----------
+
+HORIZONS = ["30min", "60min"]
+MODELS = ["xgboost", "logistic_regression", "random_forest", "lstm"]
+CLASS_NAMES = ["Normal", "Bike Shortage", "Dock Shortage"]
+
+RF_THRESHOLD = 0.7
+LSTM_SEQ_LEN = 6
+LIVE_HISTORY_RETENTION_MIN = 70
+JCDECAUX_POLL_INTERVAL_SEC = 120
+WEATHER_POLL_INTERVAL_SEC = 600
+HIGH_RISK_THRESHOLD = 0.7
+MEDIUM_RISK_THRESHOLD = 0.4
+
+BEST_MODEL_OVERALL = "xgboost"
+BEST_MODEL_OVERALL_REASON = "Highest Macro F1 on held-out test set (0.8013 vs 0.7770 LR, 0.784 RF)"
 
 # ---------- Load models ----------
 
 xgb_30 = xgb.Booster()
-xgb_30.load_model("models/candidate_booster_30min.json")
+xgb_30.load_model(str(MODELS_DIR / "candidate_booster_30min.json"))
 xgb_60 = xgb.Booster()
-xgb_60.load_model("models/booster_60min.json")
+xgb_60.load_model(str(MODELS_DIR / "booster_60min.json"))
 
-lr_30 = joblib.load("models/lr_best_30min.pkl")
-lr_60 = joblib.load("models/lr_best_60min.pkl")
-lr_scaler = joblib.load("models/lr_scaler.pkl")
+lr_30 = joblib.load(MODELS_DIR / "lr_best_30min.pkl")
+lr_60 = joblib.load(MODELS_DIR / "lr_best_60min.pkl")
+lr_scaler = joblib.load(MODELS_DIR / "lr_scaler.pkl")
 
-rf_30 = joblib.load("models/random_forest_target_30min_final.pkl")
-rf_60 = rf_30  # TEMPORARY: 60min RF file was corrupted, using 30min as fallback
-RF_THRESHOLD = 0.7
+rf_30 = joblib.load(MODELS_DIR / "random_forest_target_30min_final.pkl")
+rf_60 = joblib.load(MODELS_DIR / "random_forest_target_60min_final.pkl")
 
-lstm_30 = keras.models.load_model("models/lstm_target_30min_FINAL.keras")
-lstm_60 = keras.models.load_model("models/lstm_target_60min_FINAL.keras")
-lstm_scaler_30 = joblib.load("models/lstm_30min_scaler_FINAL.pkl")
-lstm_scaler_60 = joblib.load("models/lstm_60min_scaler_FINAL.pkl")
+lstm_30 = keras.models.load_model(MODELS_DIR / "lstm_target_30min_FINAL.keras")
+lstm_60 = keras.models.load_model(MODELS_DIR / "lstm_target_60min_FINAL.keras")
+lstm_scaler_30 = joblib.load(MODELS_DIR / "lstm_30min_scaler_FINAL.pkl")
+lstm_scaler_60 = joblib.load(MODELS_DIR / "lstm_60min_scaler_FINAL.pkl")
 
-with open("models/lstm_30min_feature_columns.json") as f:
+with open(MODELS_DIR / "lstm_30min_feature_columns.json") as f:
     lstm_feature_cols = json.load(f)
 
-with open("models/lstm_30min_best_thresholds.json") as f:
-    lstm_threshold_30 = json.load(f)
-with open("models/lstm_60min_best_thresholds.json") as f:
-    lstm_threshold_60 = json.load(f)
-
-LSTM_SEQ_LEN = 6
-
-data = pd.read_csv("data/test_features_v2.csv")
+data = pd.read_csv(DATA_DIR / "test_features_v2.csv")
 feature_cols = [c for c in data.columns if c not in ['timestamp', 'target_now', 'target_30min', 'target_60min']]
 
-with open("data/neighbour_map.pkl", "rb") as f:
+# index once by station_id for fast repeated lookups instead of filtering every request
+data_by_station = {sid: df.iloc[[0]] for sid, df in data.groupby('station_id')}
+
+with open(DATA_DIR / "neighbour_map.pkl", "rb") as f:
     NEIGHBOUR_MAP = pickle.load(f)
 
-CLASS_NAMES = ["Normal", "Bike Shortage", "Dock Shortage"]
-
-BEST_MODEL_BY_METRIC = "xgboost"
-BEST_MODEL_REASON = "Highest Macro F1 on held-out test set (0.8013 vs 0.7770 LR, 0.784 RF)"
+logger.info(f"Loaded {len(data_by_station)} stations, all four models.")
 
 
 def apply_rf_threshold(proba_row, threshold=RF_THRESHOLD):
@@ -111,15 +121,17 @@ def poll_jcdecaux_loop():
                         'bikes_available': s['available_bikes'],
                         'docks_available': s['available_bike_stands'],
                     })
-                    cutoff = now.timestamp() - 70 * 60
+                    cutoff = now.timestamp() - LIVE_HISTORY_RETENTION_MIN * 60
                     LIVE_HISTORY_BUFFER[station_id] = [
                         r for r in LIVE_HISTORY_BUFFER[station_id]
                         if r['timestamp'].timestamp() > cutoff
                     ]
-                print(f"[{now.strftime('%H:%M:%S')}] Polled {len(stations)} stations")
-            except Exception as e:
-                print(f"JCDecaux poll failed (will retry): {e}")
-        time_module.sleep(120)
+                logger.info(f"Polled {len(stations)} stations from JCDecaux")
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"JCDecaux poll failed (will retry): {e}")
+        else:
+            logger.info("No JCDECAUX_API_KEY set - skipping poll")
+        time_module.sleep(JCDECAUX_POLL_INTERVAL_SEC)
 
 
 # ---------- Live weather integration ----------
@@ -141,10 +153,10 @@ def poll_weather_loop():
                 LIVE_WEATHER_CACHE['rhum'] = w['main']['humidity']
                 LIVE_WEATHER_CACHE['wdsp'] = w['wind']['speed']
                 LIVE_WEATHER_CACHE['vis'] = w.get('visibility', 10000)
-                print("Live weather updated")
-            except Exception as e:
-                print(f"Weather poll failed (will retry): {e}")
-        time_module.sleep(600)
+                logger.info("Live weather updated")
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Weather poll failed (will retry): {e}")
+        time_module.sleep(WEATHER_POLL_INTERVAL_SEC)
 
 
 threading.Thread(target=poll_jcdecaux_loop, daemon=True).start()
@@ -174,8 +186,7 @@ def compute_live_cascade_features(station_id: int):
     if not neighbour_ids:
         return None
 
-    shortage_flags = []
-    bikes_15, bikes_30, bikes_60 = [], [], []
+    shortage_flags, bikes_15, bikes_30, bikes_60 = [], [], [], []
     docks_15, docks_30, docks_60 = [], [], []
 
     for nid in neighbour_ids:
@@ -209,9 +220,9 @@ def compute_live_cascade_features(station_id: int):
 
 def get_risk_level(proba):
     shortage_prob = float(proba[1] + proba[2])
-    if shortage_prob >= 0.7:
+    if shortage_prob >= HIGH_RISK_THRESHOLD:
         return "High", "🔴"
-    elif shortage_prob >= 0.4:
+    elif shortage_prob >= MEDIUM_RISK_THRESHOLD:
         return "Medium", "🟡"
     return "Low", "🟢"
 
@@ -234,10 +245,15 @@ def build_lstm_sequence(station_id: int, current_row_features: dict):
 
 
 def get_probabilities(station_id: int, horizon: str, model: str):
-    matches = data[data['station_id'] == station_id]
-    if matches.empty:
+    """
+    Computes class probabilities for a given station, horizon, and model,
+    blending live data (bikes/docks, lag features, cascade signal, weather,
+    time features) with historical fallback values where live data isn't
+    yet available.
+    """
+    if station_id not in data_by_station:
         return None
-    row = matches.iloc[[0]].copy()
+    row = data_by_station[station_id].copy()
 
     now = datetime.now()
     row['hour'] = now.hour
@@ -268,29 +284,31 @@ def get_probabilities(station_id: int, horizon: str, model: str):
             if key in LIVE_WEATHER_CACHE:
                 row[key] = LIVE_WEATHER_CACHE[key]
 
-    if model == "xgboost":
-        X = row[feature_cols]
-        booster = xgb_30 if horizon == "30min" else xgb_60
-        proba = booster.predict(xgb.DMatrix(X))[0]
-    elif model == "logistic_regression":
-        X = row[feature_cols]
-        lr_model = lr_30 if horizon == "30min" else lr_60
-        X_scaled = lr_scaler.transform(X)
-        proba = lr_model.predict_proba(X_scaled)[0]
-    elif model == "random_forest":
-        X = row[feature_cols]
-        rf_model = rf_30 if horizon == "30min" else rf_60
-        proba = rf_model.predict_proba(X)[0]
-    elif model == "lstm":
-        row_dict = row.iloc[0].to_dict()
-        scaler = lstm_scaler_30 if horizon == "30min" else lstm_scaler_60
-        model_obj = lstm_30 if horizon == "30min" else lstm_60
-
-        seq = build_lstm_sequence(station_id, row_dict)
-        seq_scaled = scaler.transform(seq).reshape(1, LSTM_SEQ_LEN, len(lstm_feature_cols))
-
-        proba = model_obj.predict(seq_scaled, verbose=0)[0]
-    else:
+    try:
+        if model == "xgboost":
+            X = row[feature_cols]
+            booster = xgb_30 if horizon == "30min" else xgb_60
+            proba = booster.predict(xgb.DMatrix(X))[0]
+        elif model == "logistic_regression":
+            X = row[feature_cols]
+            lr_model = lr_30 if horizon == "30min" else lr_60
+            X_scaled = lr_scaler.transform(X)
+            proba = lr_model.predict_proba(X_scaled)[0]
+        elif model == "random_forest":
+            X = row[feature_cols]
+            rf_model = rf_30 if horizon == "30min" else rf_60
+            proba = rf_model.predict_proba(X)[0]
+        elif model == "lstm":
+            row_dict = row.iloc[0].to_dict()
+            scaler = lstm_scaler_30 if horizon == "30min" else lstm_scaler_60
+            model_obj = lstm_30 if horizon == "30min" else lstm_60
+            seq = build_lstm_sequence(station_id, row_dict)
+            seq_scaled = scaler.transform(seq).reshape(1, LSTM_SEQ_LEN, len(lstm_feature_cols))
+            proba = model_obj.predict(seq_scaled, verbose=0)[0]
+        else:
+            return None
+    except Exception as e:
+        logger.error(f"Prediction failed for station={station_id}, horizon={horizon}, model={model}: {e}")
         return None
 
     return proba
@@ -302,11 +320,14 @@ def get_prediction_class(proba, model):
     return CLASS_NAMES[int(np.argmax(proba))]
 
 
+# ---------- Endpoints ----------
+
 @app.get("/")
 def root():
+    """Health check and API summary."""
     return {
         "status": "API is running",
-        "available_models": ["xgboost", "logistic_regression", "random_forest", "lstm"],
+        "available_models": MODELS,
         "live_stations_cached": len(LIVE_STATION_CACHE),
         "live_weather_available": bool(LIVE_WEATHER_CACHE),
     }
@@ -314,9 +335,13 @@ def root():
 
 @app.get("/predict")
 def predict(station_id: int, horizon: str = "30min", model: str = "xgboost"):
+    """Predict shortage class and probabilities for one station, horizon, and model."""
+    if horizon not in HORIZONS or model not in MODELS:
+        return {"error": "invalid horizon or model"}
+
     proba = get_probabilities(station_id, horizon, model)
     if proba is None:
-        return {"error": "station not found or unknown model"}
+        return {"error": "station not found or prediction failed"}
 
     prediction = get_prediction_class(proba, model)
     risk_label, risk_emoji = get_risk_level(proba)
@@ -338,8 +363,11 @@ def predict(station_id: int, horizon: str = "30min", model: str = "xgboost"):
 
 @app.get("/predict/compare")
 def compare_all(station_id: int, horizon: str = "30min"):
+    """Compare predictions across all models. Separates the statistically
+    best model overall (fixed, from test-set evaluation) from the model
+    most confident on this specific live prediction (genuinely dynamic)."""
     results = {}
-    for model in ["xgboost", "logistic_regression", "random_forest", "lstm"]:
+    for model in MODELS:
         proba = get_probabilities(station_id, horizon, model)
         if proba is None:
             continue
@@ -351,17 +379,22 @@ def compare_all(station_id: int, horizon: str = "30min"):
     if not results:
         return {"error": "station not found"}
 
+    most_confident_model = max(results, key=lambda m: results[m]["confidence"])
+
     return {
         "station_id": station_id,
         "horizon": horizon,
         "results": results,
-        "best_model": BEST_MODEL_BY_METRIC,
-        "best_model_reason": BEST_MODEL_REASON,
+        "best_model_overall": BEST_MODEL_OVERALL,
+        "best_model_overall_reason": BEST_MODEL_OVERALL_REASON,
+        "most_confident_this_prediction": most_confident_model,
+        "most_confident_score": results[most_confident_model]["confidence"],
     }
 
 
 @app.get("/cascade")
 def cascade_risk(station_id: int, horizon: str = "30min", model: str = "xgboost"):
+    """Cascade risk from a station's 3 nearest neighbours."""
     neighbour_ids = NEIGHBOUR_MAP.get(station_id, {}).get('neighbour_ids', [])
 
     own_proba = get_probabilities(station_id, horizon, model)
@@ -392,15 +425,15 @@ def cascade_risk(station_id: int, horizon: str = "30min", model: str = "xgboost"
 
 @app.get("/recommend")
 def recommend_alternatives(station_id: int, horizon: str = "30min", model: str = "xgboost"):
+    """Rank nearby stations as alternatives, worst-status-last, closest-first."""
     neighbour_ids = NEIGHBOUR_MAP.get(station_id, {}).get('neighbour_ids', [])
     distances = NEIGHBOUR_MAP.get(station_id, {}).get('distances_km', [])
 
     recommendations = []
     for nid, dist in zip(neighbour_ids, distances):
-        n_row = data[data['station_id'] == nid]
-        if n_row.empty:
+        if nid not in data_by_station:
             continue
-        n_row = n_row.iloc[0]
+        n_row = data_by_station[nid].iloc[0]
 
         n_proba = get_probabilities(int(nid), horizon, model)
         n_pred = get_prediction_class(n_proba, model)
