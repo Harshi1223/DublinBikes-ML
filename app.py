@@ -10,7 +10,7 @@ DATA_DIR = BASE_DIR / "data"
 API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
 REQUEST_TIMEOUT = 5
 
-st.set_page_config(page_title="Dublin Bikes — Shortage Predictor", layout="centered")
+st.set_page_config(page_title="Dublin Bikes — Shortage Predictor", page_icon="🚲", layout="centered")
 
 MODEL_LABELS = {
     "xgboost": "XGBoost",
@@ -36,7 +36,8 @@ def api_get(endpoint: str, params: dict = None):
         return None, f"Unexpected error contacting prediction service: {e}"
 
 
-st.title("Dublin Bikes — Shortage Predictor")
+st.title("🚲 Dublin Bikes — Shortage Predictor")
+st.caption("Predicting bike and dock shortages 30–60 minutes in advance, with cascade detection across neighbouring stations")
 
 
 @st.cache_data
@@ -105,12 +106,20 @@ if predict_clicked:
         st.warning("Live data not yet available — showing historical baseline")
 
     # ---------- Weather ----------
-    root_info, _ = api_get("/")
+    weather_result, weather_err = api_get("/live-weather")
     st.subheader("Weather")
-    if root_info and root_info.get("live_weather_available"):
-        st.success("🟢 Live weather feed active — temperature, rainfall, humidity and wind speed are blended into this prediction.")
-    else:
+    if weather_err or (weather_result and "error" in weather_result):
         st.info("Using the most recent historical weather values as a fallback.")
+    else:
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Temperature", f"{weather_result['temperature_c']:.1f}°C")
+        col2.metric("Rain", f"{weather_result['rain_mm']:.1f} mm")
+        col3.metric("Humidity", f"{weather_result['humidity_pct']:.0f}%")
+        col4.metric("Wind", f"{weather_result['wind_speed']:.1f} m/s")
+
+        if weather_result.get('weather_description'):
+            st.caption(f"☁️ {weather_result['weather_description'].capitalize()} · {weather_result.get('clouds_pct', 0)}% cloud cover")
+        st.caption("🟢 Live from OpenWeatherMap — blended into this prediction")
 
     # ---------- Prediction ----------
     if view_mode == "Single Model":

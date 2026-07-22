@@ -3,7 +3,6 @@
 
 from fastapi import FastAPI
 from pathlib import Path
-import keras
 import xgboost as xgb
 import joblib
 import pandas as pd
@@ -17,7 +16,7 @@ import threading
 import time as time_module
 from collections import defaultdict
 from datetime import datetime
-import tensorflow as tf
+from tensorflow import keras
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -39,6 +38,8 @@ LSTM_SEQ_LEN = 6
 LIVE_HISTORY_RETENTION_MIN = 70
 JCDECAUX_POLL_INTERVAL_SEC = 120
 WEATHER_POLL_INTERVAL_SEC = 600
+WEATHER_RETRY_INTERVAL_SEC = 60          # shorter wait before retrying after a failed poll
+WEATHER_CACHE_MAX_AGE_SEC = 1800         # weather older than this is treated as stale, not live
 HIGH_RISK_THRESHOLD = 0.7
 MEDIUM_RISK_THRESHOLD = 0.4
 
@@ -70,7 +71,7 @@ with open(MODELS_DIR / "lstm_30min_feature_columns.json") as f:
 data = pd.read_csv(DATA_DIR / "test_features_v2.csv")
 feature_cols = [c for c in data.columns if c not in ['timestamp', 'target_now', 'target_30min', 'target_60min']]
 
-# index once by station_id for fast repeated lookups instead of filtering every request
+# indexed once by station_id for fast repeated lookups
 data_by_station = {sid: df.iloc[[0]] for sid, df in data.groupby('station_id')}
 
 with open(DATA_DIR / "neighbour_map.pkl", "rb") as f:
@@ -80,6 +81,9 @@ logger.info(f"Loaded {len(data_by_station)} stations, all four models.")
 
 
 def apply_rf_threshold(proba_row, threshold=RF_THRESHOLD):
+    """Applies Random Forest's tuned per-class threshold (0.7) instead of
+    plain argmax, since RF's default decision boundary over-predicts
+    Normal for this dataset's class imbalance."""
     p_normal, p_bike, p_dock = proba_row
     flag_bike = p_bike >= threshold
     flag_dock = p_dock >= threshold
@@ -100,6 +104,10 @@ LIVE_HISTORY_BUFFER = defaultdict(list)
 
 
 def poll_jcdecaux_loop():
+    """Background loop: fetches current bike/dock availability for every
+    Dublin Bikes station every JCDECAUX_POLL_INTERVAL_SEC, and appends
+    each reading to a rolling per-station history buffer used to compute
+    live lag and cascade features."""
     while True:
         if JCDECAUX_API_KEY:
             try:
@@ -127,11 +135,11 @@ def poll_jcdecaux_loop():
                         r for r in LIVE_HISTORY_BUFFER[station_id]
                         if r['timestamp'].timestamp() > cutoff
                     ]
-                logger.info(f"Polled {len(stations)} stations from JCDecaux")
+                logger.info(f"JCDecaux poll OK — {len(stations)} stations updated")
             except requests.exceptions.RequestException as e:
-                logger.warning(f"JCDecaux poll failed (will retry): {e}")
+                logger.warning(f"JCDecaux poll failed, will retry in {JCDECAUX_POLL_INTERVAL_SEC}s: {e}")
         else:
-            logger.info("No JCDECAUX_API_KEY set - skipping poll")
+            logger.info("JCDECAUX_API_KEY not set — skipping poll")
         time_module.sleep(JCDECAUX_POLL_INTERVAL_SEC)
 
 
@@ -142,6 +150,12 @@ LIVE_WEATHER_CACHE = {}
 
 
 def poll_weather_loop():
+    """Background loop: fetches current weather for Dublin Airport every
+    WEATHER_POLL_INTERVAL_SEC. On failure, retries sooner
+    (WEATHER_RETRY_INTERVAL_SEC) rather than waiting the full interval,
+    so a transient outage doesn't leave the cache stale for 10 minutes.
+    Stores extra descriptive fields (weather_main, weather_description,
+    clouds) for display purposes only — these are not model features."""
     while True:
         if OPENWEATHER_API_KEY:
             try:
@@ -149,15 +163,39 @@ def poll_weather_loop():
                 response = requests.get(url, timeout=5)
                 response.raise_for_status()
                 w = response.json()
+
                 LIVE_WEATHER_CACHE['rain'] = w.get('rain', {}).get('1h', 0.0)
                 LIVE_WEATHER_CACHE['temp'] = w['main']['temp']
                 LIVE_WEATHER_CACHE['rhum'] = w['main']['humidity']
                 LIVE_WEATHER_CACHE['wdsp'] = w['wind']['speed']
                 LIVE_WEATHER_CACHE['vis'] = w.get('visibility', 10000)
-                logger.info("Live weather updated")
+
+                # display-only extras, not used as model features
+                weather_list = w.get('weather', [{}])
+                LIVE_WEATHER_CACHE['weather_main'] = weather_list[0].get('main')
+                LIVE_WEATHER_CACHE['weather_description'] = weather_list[0].get('description')
+                LIVE_WEATHER_CACHE['clouds'] = w.get('clouds', {}).get('all')
+
+                LIVE_WEATHER_CACHE['last_updated'] = datetime.now()
+
+                logger.info(f"Weather poll OK — {LIVE_WEATHER_CACHE['temp']}°C, {LIVE_WEATHER_CACHE['weather_main']}")
+                time_module.sleep(WEATHER_POLL_INTERVAL_SEC)
             except requests.exceptions.RequestException as e:
-                logger.warning(f"Weather poll failed (will retry): {e}")
-        time_module.sleep(WEATHER_POLL_INTERVAL_SEC)
+                logger.warning(f"Weather poll failed, retrying in {WEATHER_RETRY_INTERVAL_SEC}s: {e}")
+                time_module.sleep(WEATHER_RETRY_INTERVAL_SEC)
+        else:
+            logger.info("OPENWEATHER_API_KEY not set — skipping poll")
+            time_module.sleep(WEATHER_POLL_INTERVAL_SEC)
+
+
+def is_weather_fresh():
+    """Returns True only if weather data exists AND is recent enough to
+    trust as genuinely live, rather than a stale cache from a poll that
+    stopped succeeding."""
+    if 'last_updated' not in LIVE_WEATHER_CACHE:
+        return False
+    age_sec = (datetime.now() - LIVE_WEATHER_CACHE['last_updated']).total_seconds()
+    return age_sec <= WEATHER_CACHE_MAX_AGE_SEC
 
 
 threading.Thread(target=poll_jcdecaux_loop, daemon=True).start()
@@ -165,6 +203,9 @@ threading.Thread(target=poll_weather_loop, daemon=True).start()
 
 
 def compute_live_lag_features(station_id: int):
+    """Computes real 15/30/60-min rolling averages from the live history
+    buffer for one station. Returns None entirely if no history exists
+    yet; returns None per-window if that specific window has no readings."""
     history = LIVE_HISTORY_BUFFER.get(station_id, [])
     if not history:
         return None
@@ -183,6 +224,10 @@ def compute_live_lag_features(station_id: int):
 
 
 def compute_live_cascade_features(station_id: int):
+    """Computes live cascade signal (neighbour shortage rate and lag
+    averages) by looking up a station's 3 nearest neighbours in the
+    live history buffer — the same buffer JCDecaux polling fills for
+    every station, not just the one being queried."""
     neighbour_ids = NEIGHBOUR_MAP.get(station_id, {}).get('neighbour_ids', [])
     if not neighbour_ids:
         return None
@@ -220,6 +265,8 @@ def compute_live_cascade_features(station_id: int):
 
 
 def get_risk_level(proba):
+    """Converts a probability vector into a coarse High/Medium/Low risk
+    label, based on the combined bike+dock shortage probability."""
     shortage_prob = float(proba[1] + proba[2])
     if shortage_prob >= HIGH_RISK_THRESHOLD:
         return "High", "🔴"
@@ -229,6 +276,9 @@ def get_risk_level(proba):
 
 
 def build_lstm_sequence(station_id: int, current_row_features: dict):
+    """Builds a (SEQ_LEN, n_features) sequence for LSTM input, using the
+    live history buffer's most recent readings where at least SEQ_LEN
+    exist; otherwise repeats the current row as a fallback sequence."""
     history = LIVE_HISTORY_BUFFER.get(station_id, [])
 
     if len(history) >= LSTM_SEQ_LEN:
@@ -250,7 +300,7 @@ def get_probabilities(station_id: int, horizon: str, model: str):
     Computes class probabilities for a given station, horizon, and model,
     blending live data (bikes/docks, lag features, cascade signal, weather,
     time features) with historical fallback values where live data isn't
-    yet available.
+    yet available or has gone stale.
     """
     if station_id not in data_by_station:
         return None
@@ -280,7 +330,7 @@ def get_probabilities(station_id: int, horizon: str, model: str):
             if value is not None:
                 row[key] = value
 
-    if LIVE_WEATHER_CACHE:
+    if is_weather_fresh():
         for key in ['rain', 'temp', 'rhum', 'wdsp', 'vis']:
             if key in LIVE_WEATHER_CACHE:
                 row[key] = LIVE_WEATHER_CACHE[key]
@@ -316,6 +366,9 @@ def get_probabilities(station_id: int, horizon: str, model: str):
 
 
 def get_prediction_class(proba, model):
+    """Converts a probability vector into a class label, applying RF's
+    tuned threshold specifically; all other models use plain argmax
+    since their thresholds are already baked into training/tuning."""
     if model == "random_forest":
         return CLASS_NAMES[apply_rf_threshold(proba)]
     return CLASS_NAMES[int(np.argmax(proba))]
@@ -330,7 +383,7 @@ def root():
         "status": "API is running",
         "available_models": MODELS,
         "live_stations_cached": len(LIVE_STATION_CACHE),
-        "live_weather_available": bool(LIVE_WEATHER_CACHE),
+        "live_weather_available": is_weather_fresh(),
     }
 
 
@@ -458,14 +511,39 @@ def recommend_alternatives(station_id: int, horizon: str = "30min", model: str =
 
 @app.get("/live-snapshot")
 def get_live_snapshot(station_id: int):
+    """Returns the latest raw JCDecaux reading for one station."""
     live_data = LIVE_STATION_CACHE.get(station_id)
     if not live_data:
         return {"error": "no live data available for this station yet"}
     return {"station_id": station_id, "live_data": live_data}
 
 
+@app.get("/live-weather")
+def get_live_weather():
+    """Returns the current live weather values being blended into
+    predictions. Response shape unchanged from before — rain_mm,
+    temperature_c, humidity_pct, wind_speed, visibility — with new
+    optional fields (weather_main, weather_description, clouds,
+    last_updated) appended, so existing frontend code keeps working."""
+    if not is_weather_fresh():
+        return {"error": "live weather not yet available"}
+    return {
+        "rain_mm": LIVE_WEATHER_CACHE.get('rain'),
+        "temperature_c": LIVE_WEATHER_CACHE.get('temp'),
+        "humidity_pct": LIVE_WEATHER_CACHE.get('rhum'),
+        "wind_speed": LIVE_WEATHER_CACHE.get('wdsp'),
+        "visibility": LIVE_WEATHER_CACHE.get('vis'),
+        "weather_main": LIVE_WEATHER_CACHE.get('weather_main'),
+        "weather_description": LIVE_WEATHER_CACHE.get('weather_description'),
+        "clouds_pct": LIVE_WEATHER_CACHE.get('clouds'),
+        "last_updated": LIVE_WEATHER_CACHE.get('last_updated').isoformat() if LIVE_WEATHER_CACHE.get('last_updated') else None,
+    }
+
+
 @app.get("/live-status")
 def live_status(station_id: int = None):
+    """Diagnostic endpoint: how much live history has accumulated,
+    for a specific station or overall."""
     if station_id:
         history = LIVE_HISTORY_BUFFER.get(station_id, [])
         return {
@@ -477,5 +555,5 @@ def live_status(station_id: int = None):
     return {
         "total_stations_with_history": len(LIVE_HISTORY_BUFFER),
         "live_stations_cached": len(LIVE_STATION_CACHE),
-        "live_weather_available": bool(LIVE_WEATHER_CACHE),
+        "live_weather_available": is_weather_fresh(),
     }
